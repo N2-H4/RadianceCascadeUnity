@@ -1,0 +1,236 @@
+#pragma kernel CSMain
+#pragma kernel TexFill
+
+struct Params
+{
+    uint totalRays;
+    int probeRadius;
+    int probeRayCount;
+    int level;
+    int levelCount;
+    int width;
+    int height;
+    int maxLevel0Rays;
+    int intervalStartRadius;
+    int intervalEndRadius;
+    int branchingFactor;
+};
+
+struct RayMarchCursor
+{
+    float2 mapPos;
+    float2 rayStep;
+    float2 sideDist;
+    float2 deltaDist;
+};
+
+Texture2D<float4> Result;
+SamplerState linearClampSampler;
+RWTexture2D<float4> Result2;
+RWStructuredBuffer<Params> _params;
+RWStructuredBuffer<float4> _probes;
+
+int cascadeLevel = 0;
+
+const float _Constant_TAU = 6.28318530;
+bool raymarchMipmaps = false;
+
+RayMarchCursor CursorInit(float2 rayOrigin, float2 rayDir)
+{
+    RayMarchCursor cursor;
+    cursor.mapPos = floor(rayOrigin);
+    
+    if (rayDir.x == 0.0)
+    {
+        cursor.deltaDist.x = 1e+17;
+    }
+    else
+    {
+        cursor.deltaDist.x = abs(1.0f / rayDir.x);
+    }
+    
+    if (rayDir.y == 0.0)
+    {
+        cursor.deltaDist.y = 1e+17;
+    }
+    else
+    {
+        cursor.deltaDist.y = abs(1.0f / rayDir.y);
+    }
+    
+    cursor.rayStep = sign(rayDir);
+    float2 p = cursor.mapPos - rayOrigin;
+    cursor.sideDist = cursor.rayStep * p + ((cursor.rayStep * 0.5f) + 0.5f) * cursor.deltaDist;
+    
+    return cursor;
+}
+
+float4 AccumulateSample(float4 acc, float4 sample, float stepSize)
+{
+    float transparency = 1.0 - sample.a;
+    return float4(acc.rgb + acc.a * sample.rgb, acc.a * transparency);
+}
+
+float4 RayMarch(uint paramsIndex, float2 probeCenter, float2 rayOrigin, float2 rayDirection, float maxDistance)
+{
+    float levelDivisor = 1.0;
+    float levelMip = 0.0;
+
+     levelDivisor = 1.0 / (1 << _params[paramsIndex].level);
+     levelMip = _params[paramsIndex].level;
+    
+    float2 levelRayOrigin = rayOrigin * levelDivisor;
+    float2 levelProbeCenter = probeCenter * levelDivisor;
+    float levelMaxDistance = maxDistance * levelDivisor;
+    
+    RayMarchCursor cursor = CursorInit(levelRayOrigin, rayDirection);
+    float4 acc = float4(0.0, 0.0, 0.0, 1.0);
+    float2 dims = float2(_params[paramsIndex].width, _params[paramsIndex].height) * levelDivisor;
+    while (true)
+    {
+
+        if (distance(cursor.mapPos, levelProbeCenter) > levelMaxDistance)
+        {
+            break;
+        }
+        
+        if(cursor.mapPos.x<0 || cursor.mapPos.y <0 || cursor.mapPos.x >= dims.x || cursor.mapPos.y >= dims.y)
+        {
+            break;
+        }
+        
+        float4 sample = float4(0.0, 0.0, 0.0, 0.0);
+        sample = Result.SampleLevel(linearClampSampler, float2(cursor.mapPos.x / dims.x, cursor.mapPos.y / dims.y), levelMip);
+        
+        acc = AccumulateSample(acc, sample, 1.0);
+        
+        float2 mask = step(cursor.sideDist, cursor.sideDist.yx);
+        cursor.sideDist += mask * cursor.deltaDist;
+        cursor.mapPos += mask * cursor.rayStep;
+    }
+    return acc;
+}
+
+float4 SampleUpperProbe(uint paramsIndex, int2 rawPos, int raysPerProbe, int bufferStartIndex, int cascadeWidth)
+{
+    int2 pos = clamp(rawPos, int2(0,0), int2(cascadeWidth - 1,cascadeWidth - 1));
+    
+    int index = raysPerProbe * pos.x + pos.y * cascadeWidth * raysPerProbe;
+    float rayCount = 1 << _params[paramsIndex].branchingFactor;
+    float4 accColor = float4(0.0, 0.0, 0.0, 0.0);
+    float accRadiance = 0.0;
+    for (int offset = 0; offset < rayCount; offset++)
+    {
+        accColor += _probes[bufferStartIndex + index + offset];
+    }
+    
+     return accColor / rayCount;
+}
+
+float4 SampleUpperProbes(uint paramsIndex, float2 lowerProbeCenter, int rayIndex)
+{
+    uint UpperLevel = _params[paramsIndex].level + 1;
+    uint levelCount = _params[paramsIndex].levelCount;
+    if (UpperLevel >= levelCount)
+    {
+        //Here should sample enviroment or sky lightning
+        return float4(0.0, 0.0, 0.0, 1.0);
+    }
+    
+    int UpperRaysPerProbe = _params[paramsIndex].probeRayCount << _params[paramsIndex].branchingFactor;
+    int UpperLevelRayIndex = rayIndex << _params[paramsIndex].branchingFactor;
+    int UpperLevelBufferOffset = _params[paramsIndex].maxLevel0Rays * (UpperLevel % 2);
+    float UpperProbeDiameter = 2.0 * (_params[paramsIndex].probeRadius << 1);
+    float UpperCascadeWidth = _params[paramsIndex].width / UpperProbeDiameter;
+    
+    float2 index = lowerProbeCenter / UpperProbeDiameter - 0.5;
+    float2 basePos = int2(floor(index.x), floor(index.y));
+    
+    int bufferStartIndex = UpperLevelBufferOffset + UpperLevelRayIndex;
+    
+    float4 sample0 = SampleUpperProbe(paramsIndex, basePos, UpperRaysPerProbe, bufferStartIndex, UpperCascadeWidth);
+    float4 sample1 = SampleUpperProbe(paramsIndex, basePos + int2(1, 0), UpperRaysPerProbe, bufferStartIndex, UpperCascadeWidth);
+    float4 sample2 = SampleUpperProbe(paramsIndex, basePos + int2(0, 1), UpperRaysPerProbe, bufferStartIndex, UpperCascadeWidth);
+    float4 sample3 = SampleUpperProbe(paramsIndex, basePos + int2(1, 1), UpperRaysPerProbe, bufferStartIndex, UpperCascadeWidth);
+    
+    float2 factor = frac(index);
+    float2 invFactor = 1.0 - factor;
+    
+    float4 r1 = sample0 * invFactor.x + sample1 * factor.x;
+    float4 r2 = sample2 * invFactor.x + sample3 * factor.x;
+    
+    return r1 * invFactor.y + r2 * factor.y;
+}
+
+void main(uint paramsIndex, uint3 id)
+{
+    //1024 = SystemInfo.maxComputeWorkGroupSizeX
+    //256 = numthreads[x]
+    uint RayIndex = id.x + (id.y * 1024) * 256;
+    
+    if (RayIndex > _params[paramsIndex].totalRays)
+    {
+        return;
+    }
+    
+    uint ProbeIndex = RayIndex / _params[paramsIndex].probeRayCount;
+    uint ProbeRayIndex = RayIndex % _params[paramsIndex].probeRayCount;
+    
+    float ProbeRadius = _params[paramsIndex].probeRadius;
+    
+    float IntervalRadius = _params[paramsIndex].intervalEndRadius;
+    float LowerIntervalRadius = _params[paramsIndex].intervalStartRadius;
+    
+    float ProbeDiameter = ProbeRadius * 2.0;
+    float CascadeWidth = _params[paramsIndex].width / ProbeDiameter;
+    
+    uint col = ProbeIndex % CascadeWidth;
+    uint row = ProbeIndex / CascadeWidth;
+    
+    float RayAngle = 2.0 * 3.141592653589793 * (ProbeRayIndex + 0.5) / _params[paramsIndex].probeRayCount;
+    float2 RayDirection = float2(cos(RayAngle), sin(RayAngle));
+    
+    float2 RayOrigin = float2((col * ProbeDiameter) + ProbeRadius, (row * ProbeDiameter) + ProbeRadius);
+    
+    uint l = _params[paramsIndex].level;
+    uint OutputIndex = (_params[paramsIndex].maxLevel0Rays * (l % 2)) + RayIndex;
+    
+    float4 LowerResult = RayMarch(paramsIndex, RayOrigin, RayOrigin + (RayDirection * LowerIntervalRadius), RayDirection, IntervalRadius);
+    
+    float4 UpperResult = SampleUpperProbes(paramsIndex, RayOrigin, ProbeRayIndex);
+
+    _probes[OutputIndex] = float4(LowerResult.rgb + LowerResult.a * UpperResult.rgb, LowerResult.a * UpperResult.a);
+}
+
+[numthreads(256,1,1)]
+void CSMain (uint3 id : SV_DispatchThreadID)
+{
+    main(cascadeLevel, id);
+}
+
+[numthreads(16, 16, 1)]
+void TexFill(uint3 id : SV_DispatchThreadID)
+{
+    uint w = _params[0].width;
+    if (id.x >= w || id.y >= w)
+    {
+        return;
+    }
+    
+    Result2[id.xy] = float4(0.0, 0.0, 0.0, 0.0);
+    float2 pixelCenter = id.xy + 0.5;
+    float probeDiameter = _params[0].probeRadius * 2.0;
+    int cascadeWidth = _params[0].width / probeDiameter;
+    float2 screenUV = pixelCenter / _params[0].width;
+    int2 Index = int2(screenUV * cascadeWidth);
+    int StartIndex = Index.x * _params[0].probeRayCount + Index.y * _params[0].probeRayCount * cascadeWidth;
+    
+    float4 acc = float4(0.0, 0.0, 0.0, 0.0);
+    for (int rayIndex = 0; rayIndex < _params[0].probeRayCount; rayIndex++)
+    {
+        int probeRayIndex = StartIndex + rayIndex;
+        acc += _probes[probeRayIndex];
+    }
+    
+    Result2[id.xy] = acc / _params[0].probeRayCount;
+}
